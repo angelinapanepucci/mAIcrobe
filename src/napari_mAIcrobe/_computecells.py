@@ -3,6 +3,7 @@ Module responsible for computing per cell statistics
 """
 import os
 from typing import TYPE_CHECKING
+from ._prepare_arrays import squeeze_all_layers
 
 if TYPE_CHECKING:
     import napari
@@ -12,8 +13,40 @@ from napari_skimage_regionprops import add_table
 
 from .mAIcrobe.cells import CellManager
 
+@magic_factory(
+    call_button="Prepare layers",
+)
+def prepare_layers_before_cell_detection(
+    Viewer: "napari.Viewer",
+):
+    """
+    Prepare currently open napari layers before running Compute Cells.
+    Creates squeezed NumPy copies of Image and Labels layers.
+    """
+    squeeze_all_layers(Viewer)
+
+def _init_compute_cells_widget(widget):
+    widget.Shape_Fit_Type.visible = False
+    widget.Phase_Contrast_Image.visible = False
+
+    @widget.Shape_Analysis.changed.connect
+    def _toggle_shape_options(value):
+        widget.Shape_Fit_Type.visible = value
+
+        widget.Shape_Fit_Type.visible = (
+            value and compute_cells.Shape_Fit_Type.value == "phase"
+        )
+
+    @widget.Shape_Fit_Type.changed.connect
+    def _toggle_phase_image(value):
+        widget.Phase_Contrast_Image.visible = (
+            widget.Shape_Analysis.value and value == "phase"
+        )
 
 @magic_factory(
+    widget_init=_init_compute_cells_widget,
+    Shape_Analysis={"widget_type": "CheckBox"},
+    Shape_Fit_Type={"widget_type": "ComboBox", "choices": ["fluorescence", "phase"]},
     Septum_algorithm={"choices": ["Isodata", "Box"]},
     Model={
         "choices": [
@@ -34,12 +67,15 @@ from .mAIcrobe.cells import CellManager
 def compute_cells(
     Viewer: "napari.Viewer",
     Label_Image: "napari.layers.Labels",
-    Membrane_Image: "napari.layers.Image",
-    DNA_Image: "napari.layers.Image" = None,
-    Pixel_size: float = 1,
+    Fluorescent_Channel_1: "napari.layers.Image" = None,
+    Fluorescent_Channel_2: "napari.layers.Image" = None,
+    Phase_Contrast_Image: "napari.layers.Image" = None,
+    Pixel_size: float = 0.103,
     Inner_mask_thickness: int = 4,
     Septum_algorithm="Isodata",
     Baseline_margin: int = 30,
+    Shape_Analysis: bool = False,
+    Shape_Fit_Type: str = "fluorescence",
     Find_septum: bool = False,
     Find_open_septum: bool = False,
     Classify_cell_cycle: bool = False,
@@ -52,6 +88,8 @@ def compute_cells(
     Report_path: os.PathLike = "",
     Compute_Heatmap: bool = False,
 ):
+
+
     """Compute per-cell morphological features, classification and optional reports from 2D images or
     timelapse 2D+t data. Additionally supports optional heatmap generation for 2D inputs.
 
@@ -65,12 +103,14 @@ def compute_cells(
         Napari viewer to which results (table, images) are added.
     Label_Image : napari.layers.Labels
         Labels layer with segmented cells.
-    Membrane_Image : napari.layers.Image
+    Fluorescent_Channel_1 : napari.layers.Image
         Primary fluorescence image (e.g., membrane).
-    DNA_Image : napari.layers.Image, optional
+    Fluorescent_Channel_2 : napari.layers.Image, optional
         Optional secondary fluorescence image (e.g., DNA). If omitted,
         DNA-dependent metrics are NaN, colocalization is
         skipped and classification is limited to one channel.
+    Phase_Image : napari.layer.Image, optional
+        Optional phase contrast image. If omitted, shape analysis accuracy is compromized
     Pixel_size : float, optional
         Pixel size passed to analysis (if used downstream), by default 1.
     Inner_mask_thickness : int, optional
@@ -80,6 +120,9 @@ def compute_cells(
     Baseline_margin : int, optional
         Margin (pixels) around cell to compute background baseline, by
         default 30.
+    Shape_Analysis : bool, optional
+        Enable shape analysis, by default False.
+        Returns additional shape metrics (e.g., width, length, boundary).
     Find_septum : bool, optional
         Enable septum detection, by default False.
     Find_open_septum : bool, optional
@@ -114,7 +157,7 @@ def compute_cells(
     - Adds "Cell Averager" image if heatmap is computed (2D mode only).
     - Saves report files if requested and path is valid.
         - Colocalization requires two channels and is skipped when
-            `DNA_Image` is not provided.
+            `Fluorescent_Channel_2` is not provided.
     - Custom model requires a valid Keras model file (.keras)
     """
 
@@ -123,6 +166,8 @@ def compute_cells(
         "inner_mask_thickness": Inner_mask_thickness,
         "septum_algorithm": Septum_algorithm,
         "baseline_margin": Baseline_margin,
+        "shape_analysis": Shape_Analysis,
+        "shape_fit_type": Shape_Fit_Type,
         "find_septum": Find_septum,
         "find_openseptum": Find_open_septum,
         "classify_cell_cycle": Classify_cell_cycle,
@@ -137,37 +182,51 @@ def compute_cells(
     }
 
     label_data = Label_Image.data
-    membrane_data = Membrane_Image.data
-    dna_data = DNA_Image.data if DNA_Image is not None else None
+    fluorescent_1_data = Fluorescent_Channel_1.data
+    fluorescent_2_data = Fluorescent_Channel_2.data if Fluorescent_Channel_2 is not None else None
+    phase_data = Phase_Contrast_Image.data if Phase_Contrast_Image is not None else None
 
     if label_data.ndim not in (2, 3):
         raise ValueError("Label image must be 2D or 3D (T, Y, X).")
 
-    if membrane_data.ndim != label_data.ndim:
+    if fluorescent_1_data.ndim != label_data.ndim:
         raise ValueError(
-            "Label and membrane images must have matching dimensions."
+            "Label and fluorescent channel 1 images must have matching dimensions."
         )
 
-    if membrane_data.shape != label_data.shape:
+    if fluorescent_2_data is not None:
+        if fluorescent_2_data.ndim != label_data.ndim:
+            raise ValueError(
+                "Label and fluorescent channel 2 images must have matching dimensions."
+            )
+
+    if fluorescent_1_data.shape != label_data.shape:
         raise ValueError(
-            "Label and membrane images must have matching shapes."
+            "Label and fluorescent channel 1 images must have matching shapes."
         )
 
-    if dna_data is not None:
-        if dna_data.ndim != label_data.ndim:
+    if fluorescent_2_data is not None:
+        if fluorescent_2_data.shape != label_data.shape:
+            raise ValueError(
+                "Label and fluorescent channel 2 images must have matching shapes."
+            )
+
+    if fluorescent_2_data is not None:
+        if fluorescent_2_data.ndim != label_data.ndim:
             raise ValueError(
                 "Optional image must have matching dimensions with label image."
             )
-        if dna_data.shape != label_data.shape:
+        if fluorescent_2_data.shape != label_data.shape:
             raise ValueError(
                 "Optional image must have matching shape with label image."
             )
 
     cell_man = CellManager(
         label_img=label_data,
-        fluor=membrane_data,
-        optional=dna_data,
+        fluor=fluorescent_1_data,
+        optional=fluorescent_2_data,
         params=params,
+        phase=phase_data,
     )
     cell_man.compute_cell_properties()
 

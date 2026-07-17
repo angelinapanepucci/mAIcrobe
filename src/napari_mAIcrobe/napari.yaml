@@ -14,12 +14,18 @@ contributions:
     - id: napari-mAIcrobe.compute_label
       python_name: napari_mAIcrobe._computelabel:compute_label
       title: Compute label
+    - id: napari-mAIcrobe.prepare_layers_before_cell_detection
+      python_name: napari_mAIcrobe._computecells:prepare_layers_before_cell_detection
+      title: Prepare layers
     - id: napari-mAIcrobe.compute_cells
       python_name: napari_mAIcrobe._computecells:compute_cells
       title: Compute cells
     - id: napari-mAIcrobe.filter_cells
       python_name: napari_mAIcrobe._filtercells:filter_cells
       title: Filter cells
+    - id: napari-mAIcrobe.plot_results
+      python_name: napari_mAIcrobe._plotresults:ResultsAnalysisWidgetnapar
+      title: Plot results
     - id: napari-mAIcrobe.compute_pickles
       python_name: napari_mAIcrobe._compute_pickles:compute_pickles
       title: Save annotated cells as pickles
@@ -37,12 +43,16 @@ contributions:
       display_name: DNA dye S.aureus
       key: unique_id.3
   widgets:
+    - command: napari-mAIcrobe.prepare_layers_before_cell_detection
+      display_name: Prepare layers
     - command: napari-mAIcrobe.compute_label
       display_name: Compute label
     - command: napari-mAIcrobe.compute_cells
       display_name: Compute cells
+    - command: napari-mAIcrobe.plot_results
+      display_name: Plot results
     - command: napari-mAIcrobe.filter_cells
-      display_name: Filter cells
+      display_name: Filter cells    
     - command: napari-mAIcrobe.compute_pickles
       display_name: Save annotated cells as pickles
     - command: napari-mAIcrobe.batch_analysis
