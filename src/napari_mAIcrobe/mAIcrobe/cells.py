@@ -197,6 +197,9 @@ class Cell:
         self.sept_mask = None
         self.cyto_mask = None
         self.membsept_mask = None
+        self.septum_detected = False
+        self.septum_detection_status = "not_computed"
+        self.septum_detection_error = ""
 
         self.stats = dict(
             [
@@ -368,8 +371,8 @@ class Cell:
                 self.width = None
             self.length = get_bacteria_length(self.medial_axis_extended, pxsize)
 
-            self.stats["Width"] = self.width if self.width is not None else 0
-            self.stats["Length"] = self.length if self.length is not None else 0
+            self.stats["Width"] = self.width if self.width is not None else np.nan
+            self.stats["Length"] = self.length if self.length is not None else np.nan
             #self.stats["Boundary"] = self.boundary if self.boundary is not None else 0
             self.stats["Shape Analysis Status"] = "computed"
 
@@ -384,8 +387,8 @@ class Cell:
             self.width = None
             self.length = None
 
-            self.stats["Width"] = 0
-            self.stats["Length"] = 0
+            self.stats["Width"] = np.nan
+            self.stats["Length"] = np.nan
             #self.stats["Boundary"] = 0
             self.stats["Shape Analysis Status"] = "failed"
 
@@ -469,7 +472,7 @@ class Cell:
             return self.compute_sept_isodata(thick)
 
         elif algorithm == "Box":
-            return self.compute_sept_box(mask, thick)
+            return self.compute_sept_box(thick)
 
         else:
             print("Not a a valid algorithm")
@@ -985,17 +988,6 @@ class Cell:
                 )
                 self.recursive_compute_sept(inner_mask_thickness - 1, algorithm)
        
-        #try:
-            #self.sept_mask = self.compute_sept_mask(
-               # inner_mask_thickness, algorithm
-           # )
-        #except IndexError:
-           # try:
-               # self.recursive_compute_sept(
-                   # inner_mask_thickness - 1, algorithm
-               # )
-           #  except RuntimeError:
-               # self.recursive_compute_sept(inner_mask_thickness - 1, "Box")
 
 
     def recursive_compute_opensept(self, inner_mask_thickness, algorithm):

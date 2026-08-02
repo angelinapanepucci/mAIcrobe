@@ -10,9 +10,9 @@ from napari.layers import Image
 from magicgui import magicgui
 
 
-def squeeze_all_layers(viewer, suffix=" squeezed clean"):
+def squeeze_all_layers(viewer, suffix=" squeezed NumPy"):
     """
-    Creates new squeezed NumPy versions of all Image and Labels layers in the viewer.
+    Creates new squeezed NumPy versions of all Image layers in the viewer.
     Does not overwrite the original layers.
     """
     new_layers = []
@@ -44,7 +44,7 @@ def squeeze_all_layers(viewer, suffix=" squeezed clean"):
             layer.visible = False  # Hide the original layer
             
         else:
-            print(f"Skipping {layer.name}: not an Image or Labels layer")
+            print(f"Skipping {layer.name}: not an Image layer")
             continue
         
         new_layers.append(new_layer)

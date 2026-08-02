@@ -283,7 +283,7 @@ def batch_classical_segmentation(
 
 
 def omnipose_segmentation(
-    img: np.ndarray, pretrained: bool, pretrained_name: str, path2model: str
+    img: np.ndarray, pretrained: str, pretrained_name: str, path2model: str
 ) -> tuple[np.ndarray, np.ndarray]:
 
     #model_path = "/pasteur/appa/scratch/IAH_shared/cluster_utils/models/JPetit/cellpose_residual_on_style_on_concatenation_off_omni_groundtruth_data_omnipose_julienne_plus_new_pooled_2023_02_08_16_20_13.067640_epoch_9999"
