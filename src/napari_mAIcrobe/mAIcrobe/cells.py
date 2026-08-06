@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 
@@ -14,6 +15,12 @@ from .cellaverager import CellAverager
 from .cellprocessing import bound_rectangle, bounded_point, rotation_matrices
 from .colocmanager import ColocManager
 from .reports import ReportManager
+
+logger = logging.getLogger(__name__)
+
+
+class SeptumDetectionError(Exception):
+    """Raised when septum detection fails due to expected conditions (e.g., no signal, no components)."""
 
 
 class Cell:
@@ -73,7 +80,7 @@ class Cell:
         """Construct a Cell object from the label, respective masks,
         parameters, and images.
 
-        Parameters
+        Parametersnapa
         ----------
         label : int
             Cell label identifier.
@@ -282,7 +289,7 @@ class Cell:
             return self.compute_sept_isodata(thick)
 
         elif algorithm == "Box":
-            return self.compute_sept_box(mask, thick)
+            return self.compute_sept_box(thick)
 
         else:
             print("Not a a valid algorithm")
@@ -317,6 +324,10 @@ class Cell:
         """Create septum mask using isodata thresholding on inner region
         and separate the cytoplam from the septum.
 
+
+        Now validates inputs and raises SeptumDetectionError on expected
+        detection failures (no signal / no components).
+
         Parameters
         ----------
         thick : int
@@ -329,6 +340,8 @@ class Cell:
         """
         cell_mask = self.cell_mask
         fluor_box = self.fluor_mask
+        if fluor_box is None:
+            raise
         perim_mask = self.compute_perim_mask(thick)
         inner_mask = cell_mask - perim_mask
         inner_fluor = (inner_mask > 0) * fluor_box
@@ -367,14 +380,31 @@ class Cell:
         """
         cell_mask = self.cell_mask
         fluor_box = self.fluor_mask
+        if fluor_box is None:
+            raise SeptumDetectionError("Fluorescence box is None")
+
         perim_mask = self.compute_perim_mask(thick)
         inner_mask = cell_mask - perim_mask
         inner_fluor = (inner_mask > 0) * fluor_box
 
-        threshold = threshold_isodata(inner_fluor[inner_fluor > 0])
+        nonzero = inner_fluor[inner_fluor > 0]
+        if nonzero.size == 0:
+            raise SeptumDetectionError(
+                "No signal inside inner region for isodata thresholding"
+            )
+
+        try:
+            threshold = threshold_isodata(nonzero)
+        except Exception as e:
+            raise SeptumDetectionError(f"Isodata thresholding failed: {e}")
+
         interest_matrix = inner_mask * (inner_fluor > threshold)
 
         label_matrix = label(interest_matrix, connectivity=2)
+        if label_matrix.max() == 0:
+            raise SeptumDetectionError(
+                "No components found in interest matrix after thresholding"
+            )
         label_sums = []
 
         for l in range(np.max(label_matrix)):
@@ -728,27 +758,102 @@ class Cell:
                 ).astype(float)
         return img_as_float(linmask)
 
-    def recursive_compute_sept(self, inner_mask_thickness, algorithm):
-        """Compute septum mask, reducing thickness on failure.
+    def recursive_compute_sept(
+        self, inner_mask_thickness, algorithm, last_error=None
+    ):
+        """Compute septum mask, reducing thickness on failure and
+         optionally switching algorithms.
 
-        Parameters
-        ----------
-        inner_mask_thickness : int
-            Initial thickness to try.
-        algorithm : {"Isodata", "Box"}
-            Septum detection algorithm.
+        Sets consistent status flags on cell object.
+
+         Parameters
+         ----------
+         inner_mask_thickness : int
+             Initial thickness to try.
+         algorithm : {"Isodata", "Box"}
+             Septum detection algorithm.
         """
-        try:
-            self.sept_mask = self.compute_sept_mask(
-                inner_mask_thickness, algorithm
-            )
-        except IndexError:
+        # Ensure the flags are set to default values at the start of the function
+        self.septum_detected = False
+        self.septum_detection_status = "NotAttempted"
+        self.septum_detection_error = ""
+
+        thickness = int(inner_mask_thickness)
+        tried_algorithm = set()
+        while thickness >= 1:
             try:
-                self.recursive_compute_sept(
-                    inner_mask_thickness - 1, algorithm
+                self.sept_mask = self.compute_sept_mask(thickness, algorithm)
+
+                # catch error when sept_mask is None or empty
+                if self.sept_mask is None or np.sum(self.sept_mask) == 0:
+                    self.sept_mask = np.zeros_like(self.cell_mask, dtype=float)
+                    self.septum_detected = False
+                    self.septum_detection_status = "not_detected"
+                    self.septum_detection_error = ""
+                    return
+                else:
+                    self.septum_detected = True
+                    self.septum_detection_status = "detected"
+                    self.septum_detection_error = ""
+                    return
+
+            except SeptumDetectionError as e:
+                # Expected detection errors defined in compute_sept_isodata: treat as not detected
+                logger.debug(
+                    f'Cell {getattr(self, "label", "unknown")}: septum algorithm {algorithm} failed with thickness {thickness}: {e}'
                 )
-            except RuntimeError:
-                self.recursive_compute_sept(inner_mask_thickness - 1, "Box")
+                self.sept_mask = np.zeros_like(self.cell_mask, dtype=float)
+                self.septum_detected = False
+                self.septum_detection_status = "not_detected"
+                self.septum_detection_error = str(e)
+                return
+
+            except (IndexError, ValueError) as e:
+                # recursive call to reduce thickness and try again
+                logger.debug(
+                    f"Cell {getattr(self, 'label', 'unknown')}: index/value error for thickness {thickness} with algorithm '{algorithm}': {e}. Trying thickness {thickness - 1}."
+                )
+                self.recursive_compute_sept(
+                    thickness - 1, algorithm, last_error=e
+                )
+                return  # or coninue
+
+            except RuntimeError as e:
+                # try switching to Box algorithm if Isodata fails
+                logger.warning(
+                    f"RunTimeError detecting septum for cell {getattr(self, 'label', 'unknown')} with algorithm '{algorithm}' and thickness {thickness}: {e}. Trying Box algorithm."
+                )
+                if algorithm != "Box" and "Box" not in tried_algorithm:
+                    tried_algorithm.add(algorithm)
+                    self.recursive_compute_sept(thickness, "Box", last_error=e)
+                    continue
+                else:
+                    last_error = e
+                    break
+
+            except Exception as e:
+                # unexpected error: set failure with diagnostic message
+                logger.exception(
+                    f"Unexpected error detecting septum for cell {getattr(self, 'label', 'unknown')} with algorithm '{algorithm}' and thickness {thickness}: {e}."
+                )
+                self.sept_mask = np.zeros_like(self.cell_mask, dtype=float)
+                self.septum_detected = False
+                self.septum_detection_status = "Failed"
+                self.septum_detection_error = f"{type(e).__name__}: {e}"
+                return
+
+        # thickness has been reduced to less than one, and all algorithms have been tried: set failure with diagnostic message
+        logger.warning(
+            f"Septum detection exhausted recursive attempts for cell {getattr(self, 'label', 'unknown')}. Last error: {last_error}"
+        )
+        self.sept_mask = np.zeros_like(self.cell_mask, dtype=float)
+        self.septum_detected = False
+        self.septum_detection_status = "Failed_thickness_too_small"
+        self.septum_detection_error = (
+            str(last_error)
+            if last_error is not None
+            else "Inner mask thickness became < 1."
+        )
 
     def recursive_compute_opensept(self, inner_mask_thickness, algorithm):
         """Compute open-septum mask, reducing thickness on failure.
@@ -795,7 +900,44 @@ class Cell:
                     params["inner_mask_thickness"]
                 )
                 self.membsept_mask = (self.perim_mask + self.sept_mask) > 0
-                linmask = self.remove_sept_from_membrane(self.img_shape)
+
+                try:
+                    linmask = self.remove_sept_from_membrane(self.img_shape)
+                except SeptumDetectionError as e:
+                    # Handle expected detection errors and set septum as not detected
+                    logger.debug(
+                        f"Septum removal flagged for cell {self.label}: {e}"
+                    )
+                    linmask = None
+                    # if sept_mask is None or empty, set septum as not detected, otherwise mark as removal failed
+                    if self.sept_mask is None or np.sum(self.sept_mask) == 0:
+                        self.sept_mask = np.zeros_like(
+                            self.cell_mask, dtype=float
+                        )
+                        self.septum_detected = False
+                        self.septum_detection_status = "not_detected"
+                        self.septum_detection_error = str(e)
+                    else:
+                        self.septum_detection_status = "removal_failed"
+                        self.septum_detection_error = str(e)
+
+                except Exception as e:
+                    # Handle unexpected errors during septum removal
+                    logger.error(
+                        f"Error removing septum from membrane for cell {self.label}: {e}"
+                    )
+                    linmask = None
+                    self.sept_mask = np.zeros_like(self.cell_mask, dtype=float)
+                    self.septum_detected = False
+                    self.septum_detection_status = "not_detected"
+                    self.septum_detection_error = (
+                        f"Error removing septum from membrane: {e}"
+                    )
+
+                self.cyto_mask = (
+                    self.cell_mask - self.perim_mask - self.sept_mask
+                ) > 0
+
                 self.cyto_mask = (
                     self.cell_mask - self.perim_mask - self.sept_mask
                 ) > 0
