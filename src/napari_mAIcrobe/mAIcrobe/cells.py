@@ -1,5 +1,15 @@
+"""
+PART OF THE CODE IN THIS FILE IS DIRECTLY TAKEN FROM THE GITHUB REPOSITORY OF THE
+ORIGINAL AUTHORS OF MICROMORPH, SIMONE COPPOLA AND SEAMUS HOLDEN. I HAVE MADE MINOR MODIFICATIONS
+TO THE CODE TO MAKE IT WORK WITH THE REST OF THE CODE IN THIS REPOSITORY, BUT THE ORIGINAL REPOSITORY
+CAN BE FOUND HERE:
+https://github.com/HoldenLab/micromorph
+"""
+
+import logging
 import math
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -7,13 +17,22 @@ from skimage import exposure, morphology
 from skimage.draw import line
 from skimage.filters import threshold_isodata
 from skimage.io import imsave
-from skimage.measure import label, regionprops_table
+from skimage.measure import label, regionprops, regionprops_table
 from skimage.util import img_as_float, img_as_ubyte
 
 from .cellaverager import CellAverager
 from .cellprocessing import bound_rectangle, bounded_point, rotation_matrices
 from .colocmanager import ColocManager
 from .reports import ReportManager
+from .shapeanalysis import (
+    extend_medial_axis,
+    get_bacteria_boundary,
+    get_bacteria_length,
+    get_bacteria_widths,
+    get_medial_axis,
+    smooth_medial_axis,
+)
+from .utilities import apply_mask_to_image
 
 
 class Cell:
@@ -68,7 +87,14 @@ class Cell:
     """
 
     def __init__(
-        self, label, regionmask, properties, intensity, params, optional=None
+        self,
+        label,
+        regionmask,
+        properties,
+        intensity,
+        params,
+        optional=None,
+        phase=None,
     ):
         """Construct a Cell object from the label, respective masks,
         parameters, and images.
@@ -87,6 +113,9 @@ class Cell:
             Analysis parameters controlling region and stats computation.
         optional : numpy.ndarray, optional
             Optional fluorescence channel image, by default None.
+        phase : numpy.ndarray, optional
+            Phase contrast image, by default None. Required if
+            `shape_fit_type` is "phase" in params.
         """
 
         self.label = label
@@ -183,6 +212,7 @@ class Cell:
         self.cell_mask = self.image_box(regionmask)
         self.fluor_mask = self.image_box(intensity)
         self.optional_mask = self.image_box(optional)
+        self.phase_mask = self.image_box(phase)
 
         self.perim_mask = None
         self.sept_mask = None
@@ -204,12 +234,16 @@ class Cell:
                 ("Area", properties["area"].item()),
                 ("Perimeter", properties["perimeter"].item()),
                 ("Eccentricity", properties["eccentricity"].item()),
+                ("Width", 0),
+                ("Length", 0),
+                ("Shape Analysis Status", "not computed"),
             ]
         )
 
         self.selection_state = 1
         self.compute_regions(self.params)
         self.compute_fluor_stats(self.params, regionmask, intensity)
+        self.compute_shape_analysis(self.params)
 
         self.image = None
         if self.params.get("generate_report", False):
@@ -233,6 +267,207 @@ class Cell:
             return image[x0 : x1 + 1, y0 : y1 + 1]
         except TypeError:
             return None
+
+    def compute_shape_analysis(self, params):
+        """
+        Compute width, length, and boundary for one mAIcrobe cell.
+        Algorithm is taken from micromorph
+        (https://github.com/HoldenLab/micromorph/tree/794f160afd96615649a8ce95410f4d31664f9b92/src/micromorph/bacteria)
+        developed by Sean Holden and colleagues. The code has been adapted to work with the mAIcrobe plugin.
+        The function computes the medial axis of the cell, extends it, and then calculates
+        the width and length based on the medial axis and the cell boundary.
+
+        """
+
+        if not params.get("shape_analysis", False):
+            return
+
+        pxsize = params.get("pixel_size", 0.1)
+
+        # Micromorph options / defaults
+        n_widths = params.get("n_widths", 5)
+        boundary_smoothing_factor = params.get("boundary_smoothing_factor", 8)
+        fit_type = params.get(
+            "shape_fit_type", "fluorescence"
+        )  # or "phase_contrast"
+        psfFWHM = params.get("psfFWHM", 0.250)
+        error_threshold = params.get("error_threshold", 0.05)
+        max_iter = params.get("max_iter", 50)
+        min_distance_to_boundary = params.get("min_distance_to_boundary", 1)
+        step_size = params.get("step_size", 1)
+        spline_spacing = params.get("spline_spacing", 0.25)
+        spline_val = params.get("spline_val", 3)
+
+        mask = self.cell_mask.astype(bool)
+
+        if fit_type == "phase":
+            if self.phase_mask is None:
+                raise ValueError(
+                    "Phase contrast image is required for phase contrast fitting."
+                )
+            img = self.phase_mask
+        elif fit_type == "fluorescence":
+            img = self.fluor_mask
+        else:
+            raise ValueError(
+                f"Invalid fit_type '{fit_type}' specified. Must be 'fluorescence' or 'phase'."
+            )
+
+        bacteria_props = regionprops(label(mask))
+
+        self.centroid = np.asarray(bacteria_props[0].centroid)
+        self.xc = bacteria_props[0].centroid[1]
+        self.yc = bacteria_props[0].centroid[0]
+        self.xc_nm = self.xc * pxsize
+        self.yc_nm = self.yc * pxsize
+        self.bbox = bacteria_props[0].bbox
+        self.axis_major_length = bacteria_props[0].major_axis_length * pxsize
+        self.axis_minor_length = bacteria_props[0].minor_axis_length * pxsize
+        self.orientation = bacteria_props[0].orientation
+        self.area = bacteria_props[0].area * pxsize**2
+
+        self.stats["Area"] = self.area
+
+        # Apply filter to image to avoid possible issues when calculating width of bacteria in clumps.
+        # also, crop image to reduce computational time of erosion etc
+        prop = bacteria_props[0]
+        box = prop.bbox
+
+        r0 = max(box[0] - 1, 0)
+        c0 = max(box[1] - 1, 0)
+        r1 = min(box[2] + 1, mask.shape[0])
+        c1 = min(box[3] + 1, mask.shape[1])
+
+        mask_cropped = np.copy(mask[r0:r1, c0:c1])
+        image_cropped = np.copy(img[r0:r1, c0:c1])
+
+        if mask_cropped.size == 0:
+            raise ValueError(
+                f"Empty mask crop for cell {self.label}. "
+                f"bbox={box}, crop={(r0, c0, r1, c1)}, mask_shape={mask.shape}"
+            )
+
+        if fit_type == "fluorescence":
+            img_filtered = apply_mask_to_image(
+                image_cropped, mask_cropped, method="min"
+            )
+        elif fit_type == "phase":
+            img_filtered = apply_mask_to_image(
+                image_cropped, mask_cropped, method="max"
+            )
+        else:
+            error_msg = f"Invalid fit_type '{fit_type}' specified. Must be 'fluorescence' or 'phase'."
+            raise ValueError(error_msg)
+
+        try:
+            self.boundary = get_bacteria_boundary(
+                mask_cropped,
+                boundary_smoothing_factor=boundary_smoothing_factor,
+            )
+            self.perimeter = (
+                np.sum(
+                    np.sqrt(
+                        np.sum(np.diff(self.boundary, axis=0) ** 2, axis=1)
+                    )
+                )
+                * pxsize
+            )
+            self.circularity = (4 * np.pi * self.area) / (self.perimeter**2)
+
+            self.stats["Perimeter"] = self.perimeter
+            self.stats["Area"]
+
+            start_time_medial_ax = time.perf_counter()
+            self.medial_axis = smooth_medial_axis(
+                get_medial_axis(mask_cropped),
+                self.boundary,
+                error_threshold=error_threshold,
+                max_iter=max_iter,
+                spline_val=spline_val,
+                spline_spacing=spline_spacing,
+            )
+            end_time_medial_ax = time.perf_counter()
+            logging.debug(
+                f"Time taken to calculate medial axis: {end_time_medial_ax - start_time_medial_ax:.2f} "
+                f"seconds"
+            )
+
+            start_time_extend = time.perf_counter()
+            self.medial_axis_extended = extend_medial_axis(
+                self.medial_axis,
+                self.boundary,
+                error_threshold=error_threshold,
+                max_iter=max_iter,
+                min_distance_to_boundary=min_distance_to_boundary,
+                step_size=step_size,
+            )
+            end_time_extend = time.perf_counter()
+            logging.debug(
+                f"Time taken to extend medial axis: {end_time_extend - start_time_extend:.2f} seconds"
+            )
+
+            start_time_widths = time.perf_counter()
+            logging.debug(f"Calculating widths using method {fit_type}")
+            self.all_widths = get_bacteria_widths(
+                img_filtered,
+                self.medial_axis,
+                n_lines=n_widths,
+                pxsize=pxsize,
+                fit_type=fit_type,
+                line_magnitude=bacteria_props[0].axis_minor_length * 1.5,
+                psfFWHM=psfFWHM,
+            )
+            end_time_widths = time.perf_counter()
+            logging.debug(
+                f"Time taken to calculate widths: {end_time_widths - start_time_widths:.2f} seconds"
+            )
+
+            self.width = np.median(self.all_widths)
+            if self.width < 0:
+                self.width = None
+            self.length = get_bacteria_length(
+                self.medial_axis_extended, pxsize
+            )
+
+            self.stats["Width"] = (
+                self.width if self.width is not None else np.nan
+            )
+            self.stats["Length"] = (
+                self.length if self.length is not None else np.nan
+            )
+            # self.stats["Boundary"] = self.boundary if self.boundary is not None else 0
+            self.stats["Shape Analysis Status"] = "computed"
+
+            # logging.debug(f"Width: {self.width:.2f} nm from {self.all_widths}")
+            # logging.debug(f"Length: {self.length:.2f} nm")
+            # TODO: improve how errors are dealt with
+        except ValueError:
+            logging.debug("Error calculating widths or length-VALUE")
+            self.medial_axis = None
+            self.medial_axis_extended = None
+            self.all_widths = None
+            self.width = None
+            self.length = None
+
+            self.stats["Width"] = np.nan
+            self.stats["Length"] = np.nan
+            # self.stats["Boundary"] = 0
+            self.stats["Shape Analysis Status"] = "failed"
+
+        except IndexError:
+            logging.debug("Error calculating widths or length-INDEX")
+            self.medial_axis = None
+            self.medial_axis_extended = None
+            self.all_widths = None
+            self.width = None
+            self.length = None
+
+            self.stats["Width"] = 0
+            self.stats["Length"] = 0
+            # self.stats["Boundary"] = 0
+            self.stats["Shape Analysis Status"] = "failed"
+        # Set slice to zero, this gets updated if the image is part of a stack outside of this function.
+        self.slice = 0
 
     def compute_perim_mask(self, thick):
         """Compute membrane/perimeter mask by eroding the cell mask.
@@ -1117,6 +1352,8 @@ class CellManager:
     optional : ndarray or None
         Optional secondary image (e.g., DNA) matching `label_img`
         shape. Can be None.
+    phase : ndarray or None
+        Optional phase contrast image matching `label_img` shape. Can be None.
     params : dict
         Dictionary of parameters controlling the behavior of the class.
         Keys include:
@@ -1150,6 +1387,8 @@ class CellManager:
             Algorithm for septum detection ("Isodata" or "Box").
         - "baseline_margin" : int
             Margin for baseline fluorescence calculation.
+        - "shape_analysis" : bool
+            Enable shape analysis, by default False.
 
     Attributes
     ----------
@@ -1158,6 +1397,8 @@ class CellManager:
         integer.
     fluor_img : ndarray
         Fluorescence image corresponding to the labeled image.
+    phase_img : ndarray
+        Optional phase contrast image for additional analysis.
     optional_img : ndarray
         Optional image used for additional calculations.
     params : dict
@@ -1168,6 +1409,8 @@ class CellManager:
         key. Keys include:
         - "frame"
         - "label"
+        - "Width"
+        - "Length"
         - "Area"
         - "Perimeter"
         - "Eccentricity"
@@ -1191,6 +1434,8 @@ class CellManager:
     -------
     compute_cell_properties()
         Computes various properties for each cell in the labeled image(s).
+    shape_analysis()
+        Performs shape analysis on the cells, if enabled.
     calculate_DNARatio(cell_object, dna_fov, thresh)
         Static method to calculate the ratio of area that has
         discernable DNA signal for a given cell.
@@ -1202,7 +1447,7 @@ class CellManager:
     analysis, and report generation.
     """
 
-    def __init__(self, label_img, fluor, optional, params):
+    def __init__(self, label_img, fluor, optional, params, phase=None):
         """
         Initialize the class with the provided images and parameters.
 
@@ -1212,6 +1457,9 @@ class CellManager:
             Label image `(Y, X)` or timelapse label stack `(T, Y, X)`.
         fluor : ndarray
             Primary fluorescence image/stack with shape matching
+            `label_img`.
+        phase : ndarray
+            Optional phase contrast image/stack with shape matching
             `label_img`.
         optional : ndarray or None
             Optional secondary fluorescence image/stack with shape
@@ -1225,6 +1473,8 @@ class CellManager:
             Stores the labeled image.
         fluor_img : ndarray
             Stores the fluorescence image.
+        phase_img : ndarray
+            Stores the phase contrast image.
         optional_img : ndarray
             Stores the optional image.
         params : dict
@@ -1239,6 +1489,7 @@ class CellManager:
 
         self.label_img = label_img
         self.fluor_img = fluor
+        self.phase_img = phase
         self.optional_img = optional
 
         self.params = params
@@ -1295,6 +1546,11 @@ class CellManager:
         rows["Area"].append(c.stats["Area"])
         rows["Perimeter"].append(c.stats["Perimeter"])
         rows["Eccentricity"].append(c.stats["Eccentricity"])
+        rows["Width"].append(c.stats["Width"])
+        rows["Length"].append(c.stats["Length"])
+        rows["Shape Analysis Status"].append(
+            c.stats.get("Shape Analysis Status", np.nan)
+        )
         rows["Baseline"].append(c.stats["Baseline"])
         rows["Cell Median"].append(c.stats["Cell Median"])
         rows["Membrane Median"].append(c.stats["Membrane Median"])
@@ -1322,6 +1578,9 @@ class CellManager:
             "Area": [],
             "Perimeter": [],
             "Eccentricity": [],
+            "Width": [],
+            "Length": [],
+            "Shape Analysis Status": [],
             "Baseline": [],
             "Cell Median": [],
             "Membrane Median": [],
@@ -1348,16 +1607,26 @@ class CellManager:
         """
 
         if self.label_img.ndim == 2:
-            return self.label_img, self.fluor_img, self.optional_img
+            return (
+                self.label_img,
+                self.fluor_img,
+                self.optional_img,
+                self.phase_img,
+            )
 
         optional = None
         if self.optional_img is not None:
             optional = self.optional_img[frame_index]
 
+        phase = None
+        if self.phase_img is not None:
+            phase = self.phase_img[frame_index]
+
         return (
             self.label_img[frame_index],
             self.fluor_img[frame_index],
             optional,
+            phase,
         )
 
     def compute_cell_properties(self):
@@ -1387,6 +1656,14 @@ class CellManager:
 
         if self.fluor_img.shape != self.label_img.shape:
             raise ValueError("label_img and fluor_img must have same shape")
+
+        if self.phase_img is not None:
+            if self.phase_img.ndim != self.label_img.ndim:
+                raise ValueError("phase_img and label_img must have same dims")
+            if self.phase_img.shape != self.label_img.shape:
+                raise ValueError(
+                    "phase_img and label_img must have same shape"
+                )
 
         if self.optional_img is not None:
             if self.optional_img.ndim != self.label_img.ndim:
@@ -1439,7 +1716,12 @@ class CellManager:
             # is loaded once here and the per-frame FOV images are updated
             # inside the loop.  This avoids re-loading TF/Keras weights on
             # every frame
-            init_label, init_fluor, init_optional = self._frame_data(0)
+            (
+                init_label,
+                init_fluor,
+                init_optional,
+                init_phase,
+            ) = self._frame_data(0)
             ccc = CellCycleClassifier(
                 init_fluor,
                 init_optional,
@@ -1465,7 +1747,9 @@ class CellManager:
         print("Per cell stats...")
 
         for frame_index in range(n_frames):
-            label_img, fluor_img, optional_img = self._frame_data(frame_index)
+            label_img, fluor_img, optional_img, phase_img = self._frame_data(
+                frame_index
+            )
 
             if self.params["classify_cell_cycle"] and timelapse:
                 # Update the FOV images for this frame; no model reload needed.
@@ -1504,6 +1788,7 @@ class CellManager:
                     properties=proptable[proptable["label"] == l],
                     params=self.params,
                     optional=optional_img,
+                    phase=phase_img,
                 )
 
                 if self.params["generate_report"]:

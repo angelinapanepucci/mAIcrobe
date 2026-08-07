@@ -14,6 +14,11 @@ from .mAIcrobe.cells import CellManager
 
 
 @magic_factory(
+    Shape_Analysis={"widget_type": "CheckBox"},
+    Shape_Fit_Type={
+        "widget_type": "ComboBox",
+        "choices": ["fluorescence", "phase"],
+    },
     Septum_algorithm={"choices": ["Isodata", "Box"]},
     Model={
         "choices": [
@@ -36,10 +41,13 @@ def compute_cells(
     Label_Image: "napari.layers.Labels",
     Membrane_Image: "napari.layers.Image",
     DNA_Image: "napari.layers.Image" = None,
+    Phase_Contrast_Image: "napari.layers.Image" = None,
     Pixel_size: float = 1,
     Inner_mask_thickness: int = 4,
     Septum_algorithm="Isodata",
     Baseline_margin: int = 30,
+    Shape_Analysis: bool = False,
+    Shape_Fit_Type: str = "fluorescence",
     Find_septum: bool = False,
     Find_open_septum: bool = False,
     Classify_cell_cycle: bool = False,
@@ -71,6 +79,8 @@ def compute_cells(
         Optional secondary fluorescence image (e.g., DNA). If omitted,
         DNA-dependent metrics are NaN, colocalization is
         skipped and classification is limited to one channel.
+    Phase_Image : napari.layer.Image, optional
+        Optional phase contrast image. If omitted, shape analysis accuracy is compromized
     Pixel_size : float, optional
         Pixel size passed to analysis (if used downstream), by default 1.
     Inner_mask_thickness : int, optional
@@ -80,6 +90,9 @@ def compute_cells(
     Baseline_margin : int, optional
         Margin (pixels) around cell to compute background baseline, by
         default 30.
+    Shape_Analysis : bool, optional
+        Enable shape analysis, by default False.
+        Returns additional shape metrics (e.g., width, length).
     Find_septum : bool, optional
         Enable septum detection, by default False.
     Find_open_septum : bool, optional
@@ -123,6 +136,8 @@ def compute_cells(
         "inner_mask_thickness": Inner_mask_thickness,
         "septum_algorithm": Septum_algorithm,
         "baseline_margin": Baseline_margin,
+        "shape_analysis": Shape_Analysis,
+        "shape_fit_type": Shape_Fit_Type,
         "find_septum": Find_septum,
         "find_openseptum": Find_open_septum,
         "classify_cell_cycle": Classify_cell_cycle,
@@ -139,6 +154,9 @@ def compute_cells(
     label_data = Label_Image.data
     membrane_data = Membrane_Image.data
     dna_data = DNA_Image.data if DNA_Image is not None else None
+    phase_data = (
+        Phase_Contrast_Image.data if Phase_Contrast_Image is not None else None
+    )
 
     if label_data.ndim not in (2, 3):
         raise ValueError("Label image must be 2D or 3D (T, Y, X).")
@@ -168,6 +186,7 @@ def compute_cells(
         fluor=membrane_data,
         optional=dna_data,
         params=params,
+        phase=phase_data,
     )
     cell_man.compute_cell_properties()
 

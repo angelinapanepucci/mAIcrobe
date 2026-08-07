@@ -129,8 +129,8 @@ def stats_format(params):
 
     result.append(("Area", 3))
     result.append(("Perimeter", 3))
-    # result.append(('Length', 3))
-    # result.append(('Width', 3))
+    result.append(("Length", 3))
+    result.append(("Width", 3))
     result.append(("Eccentricity", 3))
     # result.append(('Irregularity', 3))
 
